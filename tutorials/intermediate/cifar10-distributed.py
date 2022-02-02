@@ -1,43 +1,36 @@
-import fire
+import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, models
-from torchvision.transforms import (
-    Compose,
-    Normalize,
-    Pad,
-    RandomCrop,
-    RandomHorizontalFlip,
-    ToTensor,
-)
+import argparse
 
 import ignite
 import ignite.distributed as idist
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from clearml import Task
 from ignite.contrib.engines import common
-from ignite.handlers import PiecewiseLinear
-from ignite.engine import (
-    Events,
-    create_supervised_trainer,
-    create_supervised_evaluator,
-)
-from ignite.handlers import Checkpoint, global_step_from_engine
+from ignite.engine import (Events, create_supervised_evaluator,
+                           create_supervised_trainer)
+from ignite.handlers import (Checkpoint, PiecewiseLinear,
+                             global_step_from_engine)
 from ignite.metrics import Accuracy, Loss
 from ignite.utils import manual_seed, setup_logger
-
+from torchvision import datasets, models
+from torchvision.transforms import (Compose, Normalize, Pad, RandomCrop,
+                                    RandomHorizontalFlip, ToTensor)
 
 config = {
     "seed": 543,
     "data_path": "cifar10",
     "output_path": "output-cifar10/",
     "model": "resnet18",
-    "batch_size": 512,
+    "batch_size": 32,
     "momentum": 0.9,
     "weight_decay": 1e-4,
-    "num_workers": 2,
+    "num_workers": 8,
     "num_epochs": 5,
     "learning_rate": 0.4,
     "num_warmup_epochs": 1,
@@ -46,7 +39,7 @@ config = {
     "backend": None,
     "resume_from": None,
     "log_every_iters": 15,
-    "nproc_per_node": None,
+    "nproc_per_node": 4,
     "with_clearml": False,
     "with_amp": False,
 }
@@ -70,10 +63,10 @@ def get_train_test_datasets(path):
     )
 
     train_ds = datasets.CIFAR10(
-        root=path, train=True, download=False, transform=train_transform
+        root=path, train=True, download=True, transform=train_transform
     )
     test_ds = datasets.CIFAR10(
-        root=path, train=False, download=False, transform=test_transform
+        root=path, train=False, download=True, transform=test_transform
     )
 
     return train_ds, test_ds
@@ -359,12 +352,87 @@ def training(local_rank, config):
         tb_logger.close()
 
 
-def run(backend=None, **spawn_kwargs):
-    config["backend"] = backend
-
-    with idist.Parallel(backend=config["backend"], **spawn_kwargs) as parallel:
+def run():
+    with idist.Parallel(backend=config["backend"]) as parallel:
         parallel.run(training, config)
 
 
+def launch(training_script, nproc_per_node=2, nnodes=1, master_addr="127.0.0.1", master_port=29500, node_rank=0, use_env=False,
+           module=False, no_python=False, training_script_args=[]):
+
+    if nproc_per_node < 2 and nnodes < 2:
+        raise ValueError("This function should not be called when training on a single CPU/GPU")
+
+    # world size in terms of number of processes
+    dist_world_size = nproc_per_node * nnodes
+
+    # set PyTorch distributed related environmental variables
+    current_env = os.environ.copy()
+    current_env["MASTER_ADDR"] = master_addr
+    current_env["MASTER_PORT"] = str(master_port)
+    current_env["WORLD_SIZE"] = str(dist_world_size)
+
+    processes = []
+
+    if 'OMP_NUM_THREADS' not in os.environ and nproc_per_node > 1:
+        current_env["OMP_NUM_THREADS"] = str(1)
+        print("*****************************************\n"
+              "Setting OMP_NUM_THREADS environment variable for each process "
+              "to be {} in default, to avoid your system being overloaded, "
+              "please further tune the variable for optimal performance in "
+              "your application as needed. \n"
+              "*****************************************".format(current_env["OMP_NUM_THREADS"]))
+
+    for local_rank in range(0, nproc_per_node):
+        # each process's rank
+        dist_rank = nproc_per_node * node_rank + local_rank
+        current_env["RANK"] = str(dist_rank)
+        current_env["LOCAL_RANK"] = str(local_rank)
+
+        # spawn the processes
+        with_python = not no_python
+        cmd = []
+        if with_python:
+            cmd = [sys.executable, "-u"]
+            if module:
+                cmd.append("-m")
+        else:
+            if not use_env:
+                raise ValueError("When using the '--no_python' flag, you must also set the '--use_env' flag.")
+            if module:
+                raise ValueError("Don't use both the '--no_python' flag and the '--module' flag at the same time.")
+
+        cmd.append(training_script)
+
+        if not use_env:
+            cmd.append("--local_rank={}".format(local_rank))
+
+        cmd.extend(training_script_args)
+
+        process = subprocess.Popen(cmd, env=current_env, cwd=os.getcwd(), pass_fds=[], close_fds=True)
+        processes.append(process)
+
+    for process in processes:
+        process.wait()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(returncode=process.returncode, cmd=cmd)
+
+
 if __name__ == "__main__":
-    fire.Fire({"run": run})
+    task = Task.init()
+    task.connect(config)
+    parser = argparse.ArgumentParser(description='Start a train task. See README for more details.')
+    parser.add_argument('--local_rank', default=None, type=int, help='Rank of the process from torch.distributed.launch')
+    args, _ = parser.parse_known_args()
+
+    if config["nproc_per_node"] == 1:
+        config["backend"] = None
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    if config["nproc_per_node"] > 1:
+        config["backend"] = "nccl"
+
+    if config["nproc_per_node"] > 1 and args.local_rank is None:
+        launch(__file__, nproc_per_node=config["nproc_per_node"])
+    else:
+        run()
